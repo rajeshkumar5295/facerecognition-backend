@@ -52,7 +52,9 @@ const AttendanceSchema = new mongoose.Schema({
   },
   faceImage: {
     filename: String,
-    path: String
+    path: String, // Local file path (deprecated)
+    cloudinaryUrl: String, // Cloudinary URL
+    cloudinaryPublicId: String // Cloudinary public ID for deletion
   },
   
   // Location Information

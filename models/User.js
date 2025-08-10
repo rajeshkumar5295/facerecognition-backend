@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
 const UserSchema = new mongoose.Schema({
   // Basic Information
@@ -58,7 +59,9 @@ const UserSchema = new mongoose.Schema({
   }],
   faceImages: [{
     filename: String,
-    path: String,
+    path: String, // Local file path (deprecated)
+    cloudinaryUrl: String, // Cloudinary URL
+    cloudinaryPublicId: String, // Cloudinary public ID for deletion
     uploadDate: {
       type: Date,
       default: Date.now
@@ -122,6 +125,14 @@ const UserSchema = new mongoose.Schema({
       },
       message: 'Organization is required for this user role'
     }
+  },
+  
+  // Password Reset
+  resetPasswordToken: {
+    type: String
+  },
+  resetPasswordExpires: {
+    type: Date
   },
   
   // Metadata
@@ -223,6 +234,20 @@ UserSchema.methods.clearFaceData = function() {
   this.faceEnrolled = false;
   this.faceEnrollmentAttempts = 0;
   return this.save();
+};
+
+// Method to generate password reset token
+UserSchema.methods.createPasswordResetToken = function() {
+  const resetToken = crypto.randomBytes(32).toString('hex');
+  
+  this.resetPasswordToken = crypto
+    .createHash('sha256')
+    .update(resetToken)
+    .digest('hex');
+  
+  this.resetPasswordExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
+  
+  return resetToken;
 };
 
 // Static method to find by credentials

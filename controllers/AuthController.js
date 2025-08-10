@@ -4,9 +4,11 @@ const path = require('path');
 const fs = require('fs').promises;
 const Joi = require('joi');
 const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 const User = require('../models/User');
 const Organization = require('../models/Organization');
+const cloudinaryService = require('../services/cloudinaryService');
 
 // Validation schemas
 const registerSchema = Joi.object({
@@ -26,34 +28,8 @@ const loginSchema = Joi.object({
   password: Joi.string().required()
 });
 
-// Multer configuration for face image uploads
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/faces/');
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, `face-${uniqueSuffix}${path.extname(file.originalname)}`);
-  }
-});
-
-const upload = multer({
-  storage: storage,
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB limit
-  },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-
-    if (mimetype && extname) {
-      return cb(null, true);
-    } else {
-      cb(new Error('Only JPEG, JPG, and PNG images are allowed'));
-    }
-  }
-});
+// Get Cloudinary upload middleware for face images
+const upload = cloudinaryService.getFaceUpload();
 
 // Utility function to generate JWT token
 const generateToken = (userId) => {
@@ -558,6 +534,335 @@ class AuthController {
       });
     }
   }
+
+  // @desc    Forgot password
+  // @route   POST /api/auth/forgot-password
+  // @access  Public
+  async forgotPassword(req, res) {
+    try {
+      const { email } = req.body;
+
+      if (!email) {
+        return res.status(400).json({
+          success: false,
+          message: 'Email is required'
+        });
+      }
+
+      const user = await User.findOne({ email });
+      if (!user) {
+        return res.status(404).json({
+          success: false,
+          message: 'No user found with that email address'
+        });
+      }
+
+      // Generate reset token
+      const resetToken = user.createPasswordResetToken();
+      await user.save({ validateBeforeSave: false });
+
+      // Create reset URL
+      const resetURL = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/reset-password/${resetToken}`;
+
+      try {
+        // Send email using the email service
+        const emailService = require('../services/emailService');
+        await emailService.sendPasswordResetEmail(user.email, {
+          userName: `${user.firstName} ${user.lastName}`,
+          resetUrl: resetURL
+        });
+
+        res.status(200).json({
+          success: true,
+          message: 'Password reset email sent successfully'
+        });
+      } catch (error) {
+        console.error('Email sending failed:', error);
+        user.resetPasswordToken = undefined;
+        user.resetPasswordExpires = undefined;
+        await user.save({ validateBeforeSave: false });
+
+        return res.status(500).json({
+          success: false,
+          message: 'Email could not be sent. Please try again later.'
+        });
+      }
+    } catch (error) {
+      console.error('Forgot password error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Something went wrong'
+      });
+    }
+  }
+
+  // @desc    Reset password
+  // @route   PATCH /api/auth/reset-password/:token
+  // @access  Public
+  async resetPassword(req, res) {
+    try {
+      const { token } = req.params;
+      const { password, confirmPassword } = req.body;
+
+      if (!password || !confirmPassword) {
+        return res.status(400).json({
+          success: false,
+          message: 'Password and confirm password are required'
+        });
+      }
+
+      if (password !== confirmPassword) {
+        return res.status(400).json({
+          success: false,
+          message: 'Passwords do not match'
+        });
+      }
+
+      if (password.length < 6) {
+        return res.status(400).json({
+          success: false,
+          message: 'Password must be at least 6 characters long'
+        });
+      }
+
+      // Get user based on the token
+      const hashedToken = crypto
+        .createHash('sha256')
+        .update(token)
+        .digest('hex');
+
+      const user = await User.findOne({
+        resetPasswordToken: hashedToken,
+        resetPasswordExpires: { $gt: Date.now() }
+      });
+
+      if (!user) {
+        return res.status(400).json({
+          success: false,
+          message: 'Token is invalid or has expired'
+        });
+      }
+
+      // Set new password
+      user.password = password;
+      user.resetPasswordToken = undefined;
+      user.resetPasswordExpires = undefined;
+      
+      // Reset login attempts if any
+      user.loginAttempts = 0;
+      user.lockUntil = undefined;
+
+      await user.save();
+
+      // Generate new JWT token
+      const jwtToken = generateToken(user._id);
+
+      res.status(200).json({
+        success: true,
+        message: 'Password reset successful',
+        data: {
+          user: formatUserResponse(user),
+          token: jwtToken
+        }
+      });
+    } catch (error) {
+      console.error('Reset password error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Something went wrong'
+      });
+    }
+  }
+
+  // @desc    Change password
+  // @route   PATCH /api/auth/change-password
+  // @access  Private
+  async changePassword(req, res) {
+    try {
+      const { currentPassword, newPassword, confirmPassword } = req.body;
+      const user = req.user;
+
+      if (!currentPassword || !newPassword || !confirmPassword) {
+        return res.status(400).json({
+          success: false,
+          message: 'Current password, new password, and confirm password are required'
+        });
+      }
+
+      if (newPassword !== confirmPassword) {
+        return res.status(400).json({
+          success: false,
+          message: 'New passwords do not match'
+        });
+      }
+
+      if (newPassword.length < 6) {
+        return res.status(400).json({
+          success: false,
+          message: 'New password must be at least 6 characters long'
+        });
+      }
+
+      // Check current password
+      const isCurrentPasswordCorrect = await user.comparePassword(currentPassword);
+      if (!isCurrentPasswordCorrect) {
+        return res.status(400).json({
+          success: false,
+          message: 'Current password is incorrect'
+        });
+      }
+
+      // Update password
+      user.password = newPassword;
+      await user.save();
+
+      res.status(200).json({
+        success: true,
+        message: 'Password changed successfully'
+      });
+    } catch (error) {
+      console.error('Change password error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to change password'
+      });
+    }
+  }
+
+  // @desc    Enroll face with file upload
+  // @route   POST /api/auth/enroll-face
+  // @access  Private
+  async enrollFace(req, res) {
+    try {
+      const user = req.user;
+      const faceDescriptors = req.body.faceDescriptors ? JSON.parse(req.body.faceDescriptors) : null;
+
+      if (!req.file) {
+        return res.status(400).json({
+          success: false,
+          message: 'Face image is required'
+        });
+      }
+
+      if (!faceDescriptors || !Array.isArray(faceDescriptors)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Face descriptors are required'
+        });
+      }
+
+      // Add face image with Cloudinary URL
+      const faceImageData = {
+        filename: req.file.filename,
+        cloudinaryUrl: req.file.path, // Cloudinary URL
+        cloudinaryPublicId: req.file.filename, // Public ID for deletion
+        uploadDate: new Date()
+      };
+
+      // Add face descriptors and image
+      user.faceImages.push(faceImageData);
+      user.faceDescriptors.push(faceDescriptors);
+
+      // Mark as enrolled if enough samples
+      if (user.faceDescriptors.length >= 1) {
+        user.faceEnrolled = true;
+      }
+
+      await user.save();
+
+      res.json({
+        success: true,
+        message: 'Face enrolled successfully',
+        data: {
+          faceEnrolled: user.faceEnrolled,
+          totalSamples: user.faceDescriptors.length,
+          imageUrl: req.file.path
+        }
+      });
+    } catch (error) {
+      console.error('Face enrollment error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to enroll face'
+      });
+    }
+  }
+
+  // @desc    Upload face as base64
+  // @route   POST /api/auth/upload-face-base64
+  // @access  Private
+  async uploadFaceBase64(req, res) {
+    try {
+      const user = req.user;
+      const { faceImage, faceDescriptors } = req.body;
+
+      if (!faceImage) {
+        return res.status(400).json({
+          success: false,
+          message: 'Face image data is required'
+        });
+      }
+
+      if (!faceDescriptors || !Array.isArray(faceDescriptors)) {
+        return res.status(400).json({
+          success: false,
+          message: 'Face descriptors are required'
+        });
+      }
+
+      // Upload to Cloudinary
+      const uploadResult = await cloudinaryService.uploadBase64(faceImage, {
+        folder: 'attendance-system/faces',
+        public_id: `face-${user._id}-${Date.now()}`,
+        transformation: [
+          { width: 800, height: 800, crop: 'limit' },
+          { quality: 'auto:good' }
+        ]
+      });
+
+      // Add face image with Cloudinary URL
+      const faceImageData = {
+        filename: uploadResult.public_id,
+        cloudinaryUrl: uploadResult.secure_url,
+        cloudinaryPublicId: uploadResult.public_id,
+        uploadDate: new Date()
+      };
+
+      // Add face descriptors and image
+      user.faceImages.push(faceImageData);
+      user.faceDescriptors.push(faceDescriptors);
+
+      // Mark as enrolled if enough samples
+      if (user.faceDescriptors.length >= 1) {
+        user.faceEnrolled = true;
+      }
+
+      await user.save();
+
+      res.json({
+        success: true,
+        message: 'Face enrolled successfully',
+        data: {
+          faceEnrolled: user.faceEnrolled,
+          totalSamples: user.faceDescriptors.length,
+          imageUrl: uploadResult.secure_url
+        }
+      });
+    } catch (error) {
+      console.error('Face upload error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to upload face image'
+      });
+    }
+  }
+
 }
 
-module.exports = new AuthController(); 
+// Create AuthController instance
+const authController = new AuthController();
+
+// Expose upload middleware on the instance
+authController.upload = upload;
+
+module.exports = authController; 

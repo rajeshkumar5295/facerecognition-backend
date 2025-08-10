@@ -44,4 +44,9 @@ router.delete('/:id', authenticate, authorize(['admin', 'super-admin']), Attenda
 // @access  Private (Admin/HR)
 router.get('/today-summary', authenticate, authorize(['admin', 'hr', 'super-admin']), AttendanceController.getTodaySummary);
 
+// @route   GET /api/attendance/by-date
+// @desc    Get attendance records by date
+// @access  Private (Admin/HR)
+router.get('/by-date', authenticate, authorize(['admin', 'hr', 'super-admin']), AttendanceController.getAttendanceByDate);
+
 module.exports = router; 

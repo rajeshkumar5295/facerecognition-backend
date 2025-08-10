@@ -4,6 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const Attendance = require('../models/Attendance');
 const User = require('../models/User');
+const cloudinaryService = require('../services/cloudinaryService');
 
 // Validation schemas
 const markAttendanceSchema = Joi.object({
@@ -18,34 +19,8 @@ const markAttendanceSchema = Joi.object({
   offlineTimestamp: Joi.date().optional()
 });
 
-// Multer configuration for attendance photos
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/attendance/');
-  },
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, `attendance-${uniqueSuffix}${path.extname(file.originalname)}`);
-  }
-});
-
-const upload = multer({
-  storage: storage,
-  limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
-  },
-  fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-
-    if (mimetype && extname) {
-      return cb(null, true);
-    } else {
-      cb(new Error('Only JPEG, JPG, and PNG images are allowed'));
-    }
-  }
-});
+// Get Cloudinary upload middleware for attendance images
+const upload = cloudinaryService.getAttendanceUpload();
 
 class AttendanceController {
   // @desc    Mark attendance (check-in/check-out)
@@ -123,11 +98,11 @@ class AttendanceController {
         location,
         note,
         isOffline,
-        photo: req.file ? {
+        faceImage: req.file ? {
           filename: req.file.filename,
-          path: req.file.path,
-          mimetype: req.file.mimetype,
-          size: req.file.size
+          path: req.file.path, // Local path (deprecated)
+          cloudinaryUrl: req.file.path, // Cloudinary URL
+          cloudinaryPublicId: req.file.filename // Public ID for deletion
         } : undefined
       });
 
@@ -681,6 +656,110 @@ class AttendanceController {
       res.status(500).json({
         success: false,
         message: 'Failed to fetch today\'s attendance summary'
+      });
+    }
+  }
+
+  // @desc    Get attendance records by date
+  // @route   GET /api/attendance/by-date
+  // @access  Private (Admin/HR)
+  async getAttendanceByDate(req, res) {
+    try {
+      const { date, search } = req.query;
+      const user = req.user;
+
+      if (!date) {
+        return res.status(400).json({
+          success: false,
+          message: 'Date parameter is required'
+        });
+      }
+
+      // Build query
+      let query = {};
+
+      // Date filtering
+      const startDate = new Date(date);
+      const endDate = new Date(date);
+      endDate.setDate(endDate.getDate() + 1);
+
+      query.createdAt = {
+        $gte: startDate,
+        $lt: endDate
+      };
+
+      // Organization filtering for admins
+      if (user.role === 'admin' && user.organization) {
+        // First get users from the same organization
+        const orgUsers = await User.find({ organization: user.organization }).select('_id');
+        const userIds = orgUsers.map(u => u._id);
+        query.user = { $in: userIds };
+      }
+
+      // Build aggregation pipeline
+      let pipeline = [
+        { $match: query },
+        {
+          $lookup: {
+            from: 'users',
+            localField: 'user',
+            foreignField: '_id',
+            as: 'user'
+          }
+        },
+        { $unwind: '$user' },
+        {
+          $project: {
+            _id: 1,
+            type: 1,
+            checkInTime: 1,
+            checkOutTime: 1,
+            status: 1,
+            isOffline: 1,
+            location: 1,
+            confidence: 1,
+            createdAt: 1,
+            updatedAt: 1,
+            user: {
+              _id: '$user._id',
+              firstName: '$user.firstName',
+              lastName: '$user.lastName',
+              fullName: { $concat: ['$user.firstName', ' ', '$user.lastName'] },
+              employeeId: '$user.employeeId',
+              department: '$user.department'
+            }
+          }
+        }
+      ];
+
+      // Search filtering
+      if (search) {
+        pipeline.splice(-1, 0, {
+          $match: {
+            $or: [
+              { 'user.firstName': { $regex: search, $options: 'i' } },
+              { 'user.lastName': { $regex: search, $options: 'i' } },
+              { 'user.employeeId': { $regex: search, $options: 'i' } },
+              { 'user.department': { $regex: search, $options: 'i' } }
+            ]
+          }
+        });
+      }
+
+      // Sort by creation time
+      pipeline.push({ $sort: { createdAt: -1 } });
+
+      const attendance = await Attendance.aggregate(pipeline);
+
+      res.json({
+        success: true,
+        data: { attendance }
+      });
+    } catch (error) {
+      console.error('Get attendance by date error:', error);
+      res.status(500).json({
+        success: false,
+        message: 'Failed to fetch attendance records'
       });
     }
   }

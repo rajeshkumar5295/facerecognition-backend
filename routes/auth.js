@@ -105,4 +105,68 @@ router.post('/verify-token', authenticate, AuthController.verifyToken);
 // @access  Private
 router.post('/logout', authenticate, AuthController.logout);
 
+// @route   POST /api/auth/forgot-password
+// @desc    Send password reset email
+// @access  Public
+router.post('/forgot-password', AuthController.forgotPassword);
+
+// @route   PATCH /api/auth/reset-password/:token
+// @desc    Reset password with token
+// @access  Public
+router.patch('/reset-password/:token', AuthController.resetPassword);
+
+// @route   PATCH /api/auth/change-password
+// @desc    Change password (authenticated user)
+// @access  Private
+router.patch('/change-password', authenticate, AuthController.changePassword);
+
+// @route   POST /api/auth/enroll-face
+// @desc    Upload face image for enrollment
+// @access  Private
+router.post('/enroll-face', authenticate, AuthController.upload.single('faceImage'), AuthController.enrollFace);
+
+// @route   POST /api/auth/upload-face-base64
+// @desc    Upload face image as base64 for enrollment
+// @access  Private
+router.post('/upload-face-base64', authenticate, AuthController.uploadFaceBase64);
+
+// @route   POST /api/auth/test-cloudinary
+// @desc    Test Cloudinary connection and configuration
+// @access  Private
+router.post('/test-cloudinary', authenticate, async (req, res) => {
+  try {
+    const cloudinaryService = require('../services/cloudinaryService');
+    
+    // Test connection
+    const connectionTest = await cloudinaryService.testConnection();
+    
+    if (!connectionTest) {
+      return res.status(500).json({
+        success: false,
+        message: 'Cloudinary connection failed',
+        details: 'Please check your environment variables'
+      });
+    }
+
+    // Get usage information
+    const usage = await cloudinaryService.getUsage();
+    
+    res.json({
+      success: true,
+      message: 'Cloudinary connection successful',
+      data: {
+        connected: true,
+        usage: usage || 'Usage info not available'
+      }
+    });
+  } catch (error) {
+    console.error('Cloudinary test error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Cloudinary test failed',
+      error: error.message
+    });
+  }
+});
+
 module.exports = router; 
